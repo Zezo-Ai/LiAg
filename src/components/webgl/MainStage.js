@@ -4,11 +4,45 @@ import {OrbitControls} from "three/examples/jsm/controls/OrbitControls";
 import MinGeometryFinder from "./MinGeometryFinder";
 import MinSTLExporter from "./MinSTLExporter";
 
+const DEFAULT_MESH_COLOR = {r: 0.5, g: 0.5, b: 0.5};
+const OBJECT_NAME_ALIASES = {
+    Torso_Shoulder_L: "Torso_Sholder_L",
+    Torso_Shoulder_R: "Torso_Sholder_R"
+};
+const STL_EXPORT_ORDER = [
+    "mesh-stand",
+    "mesh-torso",
+    "mesh-arm-l",
+    "mesh-arm-r",
+    "mesh-foot-l",
+    "mesh-foot-r",
+    "mesh-hand-l",
+    "mesh-hand-r",
+    "mesh-head",
+    "mesh-leg-l",
+    "mesh-leg-r",
+    "mesh-neck"
+];
+
+function setMaterialColor(material, color) {
+    if (Array.isArray(material)) {
+        for (const entry of material) {
+            setMaterialColor(entry, color);
+        }
+
+        return;
+    }
+
+    if (material?.color?.setRGB) {
+        material.color.setRGB(color.r, color.g, color.b);
+    }
+}
+
 export default class MainStage {
     constructor() {
         if (MainStage._instance) {
             console.warn("Singleton classes can't be instantiated more than once.")
-            return this;
+            return MainStage._instance;
         }
         MainStage._instance = this
 
@@ -19,26 +53,22 @@ export default class MainStage {
         this.renderer = null;
         this.controls = null;
         this.loader = null;
+        this.minGeometryFinder = new MinGeometryFinder();
+        this.stlExporter = new MinSTLExporter();
+        this.cameraTarget = new THREE.Vector3(0, 1, 0);
+        this.downloadUrl = null;
+
+        this.animate = this.animate.bind(this);
+        this.handleResize = this.handleResize.bind(this);
 
         this.selected = "Head";
         this.highLightColor = {r: 0.4, g: 0.5, b: 0.6};
-        this.normalColor = {r: 0.5, g: 0.5, b: 0.5}
+        this.normalColor = {...DEFAULT_MESH_COLOR}
         this.standColor = {r: 0.4, g: 0.4, b: 0.4}
 
         // This group will contain all the meshes but not the floor, the lights etc...
         this.group = new THREE.Group();
         this.group.name = "avatarModel"
-
-        // Fix the spelling mistake while modeling.
-        this.group.getMyObjectByName = function (name) {
-            if (name === "Torso_Shoulder_L") {
-                name = "Torso_Sholder_L"
-            }
-            if (name === "Torso_Shoulder_R") {
-                name = "Torso_Sholder_R"
-            }
-            return this.group.getObjectByName(name);
-        }.bind(this);
 
         //This keeps track of every mesh on the viewport
         this.loadedMeshes = {
@@ -154,16 +184,7 @@ export default class MainStage {
         this.link = document.createElement("a");
         this.link.style.display = "none";
         document.body.appendChild(this.link);
-
-        document.body.onresize = function () {
-            if (this.initialized) {
-                //size of viewport
-                this.renderer.setSize(window.innerWidth, window.innerHeight);
-                //aspect ratio update
-                this.camera.aspect = window.innerWidth / window.innerHeight;
-                this.camera.updateProjectionMatrix();
-            }
-        }.bind(this);
+        window.addEventListener("resize", this.handleResize);
 
         // Expose global flags
         window.loaded = false;
@@ -189,15 +210,6 @@ export default class MainStage {
         this.scene.background = new THREE.Color(80, 80, 80);
         this.scene.fog = new THREE.Fog(0x222222, 1, 20);
         this.scene.add(this.group);
-        this.scene.getMyObjectByName = function (name) {
-            if (name === "Torso_Shoulder_L") {
-                name = "Torso_Sholder_L"
-            }
-            if (name === "Torso_Shoulder_R") {
-                name = "Torso_Sholder_R"
-            }
-            return this.scene.getObjectByName(name);
-        }.bind(this);
 
         // this.buildDevHelper();
         this.buildGrid();
@@ -208,6 +220,155 @@ export default class MainStage {
         this.buildFloor();
 
         this.initialized = true;
+    }
+
+    normalizeObjectName(name) {
+        return OBJECT_NAME_ALIASES[name] || name;
+    }
+
+    getSceneObjectByName(name) {
+        return this.scene?.getObjectByName(this.normalizeObjectName(name));
+    }
+
+    getGroupObjectByName(name) {
+        return this.group.getObjectByName(this.normalizeObjectName(name));
+    }
+
+    handleResize() {
+        if (!this.initialized) {
+            return;
+        }
+
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.camera.aspect = window.innerWidth / window.innerHeight;
+        this.camera.updateProjectionMatrix();
+    }
+
+    applyColor(root, color) {
+        if (!root) {
+            return;
+        }
+
+        root.traverse(function (child) {
+            if (child.isMesh === true) {
+                setMaterialColor(child.material, color);
+            }
+        });
+    }
+
+    applyPoseRotation(bone, rotation) {
+        if (!(bone instanceof THREE.Bone) || !rotation) {
+            return;
+        }
+
+        bone.rotation.set(rotation.x, rotation.y, rotation.z);
+    }
+
+    applyPoseToObject(root, poseData) {
+        if (!poseData) {
+            return;
+        }
+
+        root.traverse(child => {
+            if (child instanceof THREE.Bone) {
+                this.applyPoseRotation(child, poseData[child.name]);
+            }
+        });
+    }
+
+    getStandOffset() {
+        const footR = this.getSceneObjectByName("FootR");
+        const footL = this.getSceneObjectByName("FootL");
+
+        if (!footR || !footL) {
+            return null;
+        }
+
+        const resultR = this.minGeometryFinder.parse(footR);
+        const resultL = this.minGeometryFinder.parse(footL);
+
+        return Math.min(resultR, resultL);
+    }
+
+    updateStandPosition() {
+        const result = this.getStandOffset();
+        const torsoHip = this.getSceneObjectByName("Torso_Hip");
+
+        if (result === null || !torsoHip) {
+            return;
+        }
+
+        torsoHip.position.y -= result;
+    }
+
+    removeAttachedBones(object) {
+        if (!object?.children?.length) {
+            return;
+        }
+
+        for (const child of [...object.children]) {
+            if (child instanceof THREE.Bone) {
+                object.remove(child);
+            }
+        }
+    }
+
+    resolveMeshChange(category, part, isLeft) {
+        switch (category) {
+            case "torso":
+                return {
+                    meshType: "Torso",
+                    meshFileName: part.file,
+                    rotation: undefined
+                };
+            case "head":
+                return {
+                    meshType: "Head",
+                    meshFileName: part.file,
+                    rotation: part.rotation
+                };
+            case "hand":
+                return {
+                    meshType: isLeft ? "HandL" : "HandR",
+                    meshFileName: isLeft ? part.file[0] : part.file[1],
+                    rotation: isLeft ? part.rotation[0] : part.rotation[1]
+                };
+            case "arm":
+                return {
+                    meshType: isLeft ? "ArmL" : "ArmR",
+                    meshFileName: isLeft ? part.file[0] : part.file[1],
+                    rotation: isLeft ? part.rotation[0] : part.rotation[1]
+                };
+            case "foot":
+                return {
+                    meshType: isLeft ? "FootL" : "FootR",
+                    meshFileName: isLeft ? part.file[0] : part.file[1],
+                    rotation: isLeft ? part.rotation[0] : part.rotation[1]
+                };
+            case "leg":
+                return {
+                    meshType: isLeft ? "LegL" : "LegR",
+                    meshFileName: isLeft ? part.file[0] : part.file[1],
+                    rotation: isLeft ? part.rotation[0] : part.rotation[1]
+                };
+            default:
+                return null;
+        }
+    }
+
+    getOrderedExportTargets() {
+        const targetNames = new Set(STL_EXPORT_ORDER);
+        const targets = new Map();
+
+        this.group.traverse(child => {
+            if (targetNames.has(child.name) && !targets.has(child.name)) {
+                targets.set(child.name, child);
+            }
+        });
+
+        return STL_EXPORT_ORDER
+            .map(meshName => targets.get(meshName))
+            .filter(Boolean);
     }
 
     buildDevHelper() {
@@ -299,13 +460,14 @@ export default class MainStage {
 
     buildControls() {
         this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-        this.controls.target.set(0, 0, 0);
+        this.controls.target.copy(this.cameraTarget);
         //Controlling max and min for ease of use
         this.controls.minDistance = 2;
         this.controls.maxDistance = 7;
         this.controls.minPolarAngle = 0;
         this.controls.maxPolarAngle = Math.PI;
         this.controls.enablePan = false;
+        this.controls.update();
     }
 
     buildLights() {
@@ -353,12 +515,11 @@ export default class MainStage {
     }
 
     renderScene() {
-        this.camera.lookAt(new THREE.Vector3(0, 1, 0));
         this.renderer.render(this.scene, this.camera);
     }
 
     animate() {
-        requestAnimationFrame(this.animate.bind(this));
+        requestAnimationFrame(this.animate);
         this.controls.update();
         this.renderScene();
     }
@@ -401,11 +562,11 @@ export default class MainStage {
             glTF => {
                 let loadedContentRoot = glTF.scene.children[0];
                 loadedContentRoot.traverse(function (child) {
-                    if (child instanceof THREE.Mesh) {
+                    if (child.isMesh === true) {
                         // Gives a fixed name to the mesh and same gray color
                         child.name = "mesh-" + meshType.toLowerCase();
                         child.castShadow = true;
-                        child.material.color = {r: 0.5, g: 0.5, b: 0.5};
+                        setMaterialColor(child.material, DEFAULT_MESH_COLOR);
                     }
                 });
 
@@ -429,29 +590,24 @@ export default class MainStage {
                 }
 
                 // Putting the new mesh in the pose configuration if any pose as been selected
-                if (poseData) {
-                    loadedContentRoot.traverse(function (child) {
-                        if (child instanceof THREE.Bone) {
-                            if (poseData[child.name]) {
-                                window.changeRotation(child.name, poseData[child.name].x, "x");
-                                window.changeRotation(child.name, poseData[child.name].y, "y");
-                                window.changeRotation(child.name, poseData[child.name].z, "z");
-                            }
-                        }
-                    });
-                }
+                this.applyPoseToObject(loadedContentRoot, poseData);
 
                 if (
                     typeof parentAttachment !== "undefined" &&
                     typeof childAttachment !== "undefined"
                 ) {
-                    let targetBone = this.scene.getMyObjectByName(parentAttachment);
-                    let object = this.scene.getMyObjectByName(childAttachment);
-                    this.clearPosition(object);
-                    this.rotateElement(object, true);
-                    this.rotateElement(object, false, rotation);
-                    targetBone.add(object);
+                    let targetBone = this.getSceneObjectByName(parentAttachment);
+                    let object = this.getSceneObjectByName(childAttachment);
+
+                    if (targetBone && object) {
+                        this.clearPosition(object);
+                        this.rotateElement(object, true);
+                        this.rotateElement(object, false, rotation);
+                        targetBone.add(object);
+                    }
                 }
+
+                this.scene.updateMatrixWorld(true);
 
                 //Going to look for all children of current mesh
                 let children = this.childrenList[meshType];
@@ -462,13 +618,13 @@ export default class MainStage {
                 }
 
                 if (meshType === "FootR") {
-                    if (this.scene.getMyObjectByName("FootL_Toes_L")) {
-                        this.scene.updateMatrixWorld();
+                    if (this.getSceneObjectByName("FootL_Toes_L")) {
+                        this.scene.updateMatrixWorld(true);
                         this.placeStand();
                     }
                 } else if (meshType === "FootL") {
-                    if (this.scene.getMyObjectByName("FootR_Toes_R")) {
-                        this.scene.updateMatrixWorld();
+                    if (this.getSceneObjectByName("FootR_Toes_R")) {
+                        this.scene.updateMatrixWorld(true);
                         this.placeStand();
                     }
                 }
@@ -482,7 +638,7 @@ export default class MainStage {
     }
 
     refreshMesh(meshType, isFirstLoad, bones, poseData) {
-        this.group.remove(this.group.getMyObjectByName(meshType));
+        this.group.remove(this.getGroupObjectByName(meshType));
         this.placeMesh(
             this.loadedMeshes[meshType].name,
             this.meshStaticInfo[meshType].partCategory,
@@ -498,7 +654,6 @@ export default class MainStage {
     }
 
     loadStand(stand) {
-        let minFinder = new MinGeometryFinder();
         let standColor = this.standColor;
         this.loader.load(
             "./models/stand/" + stand + ".glb",
@@ -506,25 +661,21 @@ export default class MainStage {
                 let loadedContentRoot = glTF.scene.children[0];
 
                 loadedContentRoot.traverse(function (child) {
-                    if (child instanceof THREE.Mesh) {
+                    if (child.isMesh === true) {
                         child.name = "mesh-stand";
                         child.castShadow = true;
                         child.receiveShadow = true;
-                        child.material.color = standColor;
+                        setMaterialColor(child.material, standColor);
                     }
                 });
 
-                let resultR = minFinder.parse(this.scene.getMyObjectByName("FootR"));
-                let resultL = minFinder.parse(this.scene.getMyObjectByName("FootL"));
-                let result = resultL > resultR ? resultR : resultL;
-
                 //Default color to all the meshes
                 if (loadedContentRoot.material) {
-                    loadedContentRoot.material.color = standColor;
+                    setMaterialColor(loadedContentRoot.material, standColor);
                 }
 
                 this.group.add(loadedContentRoot);
-                this.scene.getMyObjectByName("Torso_Hip").position.y -= result;
+                this.updateStandPosition();
                 window.loaded = true;
             },
             null,
@@ -535,22 +686,18 @@ export default class MainStage {
     }
 
     placeStand() {
-        let minFinder = new MinGeometryFinder();
-
-        if (this.scene.getMyObjectByName("mesh-stand")) {
-            let resultR = minFinder.parse(this.scene.getMyObjectByName("FootR"));
-            let resultL = minFinder.parse(this.scene.getMyObjectByName("FootL"));
-            let result = resultL > resultR ? resultR : resultL;
-
-            this.scene.getMyObjectByName("Torso_Hip").position.y -= result;
+        if (this.getSceneObjectByName("mesh-stand")) {
+            this.updateStandPosition();
         } else {
             this.loadStand("circle");
         }
     }
 
     changeStand(stand) {
-        if (this.scene.getMyObjectByName("mesh-stand")) {
-            this.group.remove(this.scene.getMyObjectByName("mesh-stand"));
+        const currentStand = this.getSceneObjectByName("mesh-stand");
+
+        if (currentStand) {
+            this.group.remove(currentStand);
             this.loadStand(stand);
         }
     };
@@ -572,63 +719,23 @@ export default class MainStage {
 
     changeMesh(category, part, isLeft, bones, poseData) {
         window.partLoaded = false;
-        let meshType;
-        let meshFileName;
-        let rotation;
-
-        switch (category) {
-            case "torso":
-                meshFileName = part.file;
-                rotation = undefined;
-                meshType = "Torso";
-                break;
-            case "head":
-                meshFileName = part.file;
-                rotation = part.rotation;
-                meshType = "Head";
-                break;
-            case "hand":
-                meshType = isLeft ? "HandL" : "HandR";
-                meshFileName = isLeft ? part.file[0] : part.file[1];
-                rotation = isLeft ? part.rotation[0] : part.rotation[1];
-                break;
-            case "arm":
-                meshType = isLeft ? "ArmL" : "ArmR";
-                meshFileName = isLeft ? part.file[0] : part.file[1];
-                rotation = isLeft ? part.rotation[0] : part.rotation[1];
-                break;
-            case "foot":
-                meshType = isLeft ? "FootL" : "FootR";
-                meshFileName = isLeft ? part.file[0] : part.file[1];
-                rotation = isLeft ? part.rotation[0] : part.rotation[1];
-                break;
-            case "leg":
-                meshType = isLeft ? "LegL" : "LegR";
-                meshFileName = isLeft ? part.file[0] : part.file[1];
-                rotation = isLeft ? part.rotation[0] : part.rotation[1];
-                break;
-            default:
-                meshType = undefined;
-        }
+        const nextMesh = this.resolveMeshChange(category, part, isLeft);
+        const meshType = nextMesh?.meshType;
+        const meshFileName = nextMesh?.meshFileName;
+        const rotation = nextMesh?.rotation;
 
         if (meshType) {
             let parentAttachmentName = this.meshStaticInfo[meshType].parentAttachment;
             let childAttachmentName = this.meshStaticInfo[meshType].childAttachment;
-            let currentMesh = this.group.getMyObjectByName(meshType);
+            let currentMesh = this.getGroupObjectByName(meshType);
             let parentAttachmentMesh =
                 meshType === "Torso"
-                    ? this.scene.getMyObjectByName("Torso_Hip")
-                    : this.group.getMyObjectByName(parentAttachmentName);
+                    ? this.getSceneObjectByName("Torso_Hip")
+                    : this.getGroupObjectByName(parentAttachmentName);
 
             if (currentMesh) {
                 this.group.remove(currentMesh);
-                if (parentAttachmentMesh.children) {
-                    for (const child of parentAttachmentMesh.children) {
-                        if (child instanceof THREE.Bone) {
-                            parentAttachmentMesh.remove(child);
-                        }
-                    }
-                }
+                this.removeAttachedBones(parentAttachmentMesh);
                 this.placeMesh(
                     meshFileName,
                     category,
@@ -647,16 +754,8 @@ export default class MainStage {
     };
 
     changeColor(item, chosenColor) {
-        let mesh = item === "pose" ? this.group : this.scene.getMyObjectByName(item);
-        mesh.traverse(function (child) {
-            if (child instanceof THREE.Mesh) {
-                if (child.material) {
-                    child.material.color.r = chosenColor.r;
-                    child.material.color.g = chosenColor.g;
-                    child.material.color.b = chosenColor.b;
-                }
-            }
-        });
+        let mesh = item === "pose" ? this.group : this.getSceneObjectByName(item);
+        this.applyColor(mesh, chosenColor);
     }
 
     selectedMesh(meshType) {
@@ -672,14 +771,14 @@ export default class MainStage {
     };
 
     getRotation(bone_name) {
-        let bone = this.scene.getMyObjectByName(bone_name);
+        let bone = this.getSceneObjectByName(bone_name);
         if (bone instanceof THREE.Bone) {
             return {x: bone.rotation.x, y: bone.rotation.y, z: bone.rotation.z};
         }
     };
 
     changeRotation(bone_name, value, axis) {
-        let bone = this.scene.getMyObjectByName(bone_name);
+        let bone = this.getSceneObjectByName(bone_name);
         if (bone instanceof THREE.Bone) {
             switch (axis) {
                 case "x":
@@ -697,32 +796,34 @@ export default class MainStage {
     };
 
     loadPose(poseData, bones) {
-        let L, R = false;
+        let shouldPlaceStand = false;
+
         for (const boneElem of bones) {
             let bone = boneElem.bone;
-            window.changeRotation(bone, poseData[bone].x, "x");
-            window.changeRotation(bone, poseData[bone].y, "y");
-            window.changeRotation(bone, poseData[bone].z, "z");
+            const rotation = poseData[bone];
+            const targetBone = this.getSceneObjectByName(bone);
 
-            this.scene.updateMatrixWorld();
+            this.applyPoseRotation(targetBone, rotation);
 
-            if (bone === "LegL_Foot_L") {
-                L = true;
-                if (L && R) {
-                    this.placeStand();
-                }
+            if (bone === "LegL_Foot_L" || bone === "LegR_Foot_R") {
+                shouldPlaceStand = true;
             }
-            if (bone === "LegR_Foot_R") {
-                R = true;
-                if (L && R) {
-                    this.placeStand();
-                }
-            }
+        }
+
+        this.scene.updateMatrixWorld(true);
+
+        if (shouldPlaceStand) {
+            this.placeStand();
         }
     };
 
     save(blob, filename) {
-        this.link.href = URL.createObjectURL(blob);
+        if (this.downloadUrl) {
+            URL.revokeObjectURL(this.downloadUrl);
+        }
+
+        this.downloadUrl = URL.createObjectURL(blob);
+        this.link.href = this.downloadUrl;
         this.link.download = filename || "untitled.json";
         this.link.click();
     }
@@ -736,36 +837,10 @@ export default class MainStage {
     }
 
     exportToSTL(name) {
-        let exporter = new MinSTLExporter();
-
         if (name) {
-            this.saveString(exporter.parse(this.group), name + ".stl");
+            this.saveString(this.stlExporter.parse(this.group), name + ".stl");
         } else {
-            let stlList = [];
-            // I need to know in which order the files are exported...
-            let meshes = [
-                "mesh-stand",
-                "mesh-torso",
-                "mesh-arm-l",
-                "mesh-arm-r",
-                "mesh-foot-l",
-                "mesh-foot-r",
-                "mesh-hand-l",
-                "mesh-hand-r",
-                "mesh-head",
-                "mesh-leg-l",
-                "mesh-leg-r",
-                "mesh-neck"
-            ];
-            for (const mesh of meshes) {
-                this.group.traverse(function (child) {
-                    if (child.name === mesh) {
-                        stlList.push(exporter.parse(child))
-                    }
-                });
-            }
-
-            return stlList;
+            return this.getOrderedExportTargets().map(mesh => this.stlExporter.parse(mesh));
         }
     };
 }
